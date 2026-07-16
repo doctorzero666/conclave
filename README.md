@@ -7,7 +7,7 @@ Multi-LLM deliberation in your terminal. One command, multiple models, side-by-s
 ## Install
 
 ```bash
-pip install conclave
+pip install conclave-llm
 ```
 
 ### Prerequisites
