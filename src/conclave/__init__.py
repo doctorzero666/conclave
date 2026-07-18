@@ -1,17 +1,3 @@
-"""conclave — multi-LLM deliberation terminal tool.
+"""conclave v3.0.0 — 多模型审议协议引擎"""
 
-Like a conclave of cardinals, but for AI models.
-"""
-
-__version__ = "0.1.0"
-
-from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass
-class PanelResult:
-    """一次 panel 调用的完整结果。"""
-    prompt: str
-    responses: list  # list[Response]
-    from_cache: bool = False
+__version__ = "3.0.0"

@@ -1,8 +1,17 @@
-# conclave
+# conclave v3
 
-> *Like a conclave of cardinals, but for AI models.*
+> *Multi-LLM deliberation protocol engine — like a conclave of AI cardinals.*
 
-Multi-LLM deliberation in your terminal. One command, multiple models, side-by-side comparison. No API keys, no per-token cost — uses your existing Claude Code / Codex CLI subscriptions.
+V3 is a complete rewrite. It's not just "ask two models and compare" — it's a **multi-round deliberation protocol** where models critique each other, revise their answers, and a judge synthesizes a consensus report.
+
+## What's new in v3
+
+- 🔄 **Multi-round deliberation** — Initial → Critique → Revise → Synthesize
+- 🔌 **Plugin provider system** — CLI (Claude Code/Codex) + API (OpenAI/Anthropic/DeepSeek)
+- 🧠 **Semantic synthesizer** — LLM-powered judge generates consensus/divergence/insight report
+- 📡 **Streaming** — Real-time output for each provider
+- ⚙️ **Config system** — `~/.conclave/config.yaml`
+- 🧪 **Test suite** — 22 tests, CI via GitHub Actions
 
 ## Install
 
@@ -12,109 +21,73 @@ pip install conclave-llm
 
 ### Prerequisites
 
-conclave doesn't manage API keys. It calls LLMs through CLI tools you already have installed and authenticated:
+conclave doesn't manage API keys. It connects through:
 
-| Backend | Install |
-|---------|---------|
-| Claude | `npm install -g @anthropic-ai/claude-code` then `claude login` |
-| Codex  | `npm install -g @openai/codex` then `codex login` |
+| Provider Type | What you need |
+|:--|:--|
+| CLI | `claude` and/or `codex` CLI installed + logged in |
+| OpenAI | `OPENAI_API_KEY` env var |
+| Anthropic | `ANTHROPIC_API_KEY` env var |
+| DeepSeek | `DEEPSEEK_API_KEY` env var |
 
 ## Quick Start
 
 ```bash
-# Ask Claude + Codex the same question
-conclave "What's the best caching strategy for a Flask API?"
+# Initialize config
+conclave config init
 
-# Only Claude
-conclave "Review app.py for SQL injection" --backends claude
+# Ask 2 models the same question
+conclave "Should we use Redis or Postgres for this caching layer?"
 
-# Diff view: see exactly where models agree and disagree
-conclave "Should we use Redis or in-memory cache?" --diff
+# Multi-round deliberation with synthesis
+conclave "Design a rate-limiting strategy for our API" --rounds 3
 
-# JSON output for scripts
-conclave "Summarize this in 3 bullet points" --format json
+# Use specific providers
+conclave "Review this architecture" --providers claude,deepseek
 
-# Copy result to clipboard
-conclave "Draft a PostgreSQL migration script" --copy
+# JSON output
+conclave "Compare Kubernetes vs Nomad" --format json --rounds 2
 ```
 
-## Killer Use Cases
-
-### 1. Code Security Review
-
-```bash
-$ conclave "Review auth.py — any security issues?" --backends claude,codex
-
-## Panel: 'Review auth.py — any security issues?'
-
-### claude (claude-sonnet-4) | 15.2s
-⚠️ CRITICAL: JWT secret hardcoded on line 12. Use env var.
-⚠️ No rate limiting on /login endpoint — brute force risk.
-
-### codex (gpt-5.6-sol) | 8.7s
-1. Line 12: hardcoded secret → os.environ.get("JWT_SECRET")
-2. Missing password strength validation
-3. Session tokens don't expire
-```
-
-Two models catch different issues. Don't choose — ask both.
-
-### 2. Architecture Decision
-
-```bash
-$ conclave "Monolith → microservices: where to start?" --diff
-
---- claude (claude-sonnet-4)
-+++ codex (gpt-5.6-sol)
--Start with the auth module — it's the most self-contained
-+Start with notifications — lowest risk, highest impact
--Use strangler fig: route old→new gradually
-+Run both in parallel, compare outputs
-```
-
-### 3. Documentation & Code Generation
-
-```bash
-$ conclave "Write a pydantic model for a Stripe webhook event" --copy
-# → both models' versions on your clipboard
-```
-
-## All Options
+## Deliberation Protocol
 
 ```
-conclave run [OPTIONS] PROMPT
-
-Options:
-  -b, --backends TEXT    Comma-separated backends (default: claude,codex)
-  -f, --format [markdown|json]  Output format (default: markdown)
-  --diff / --no-diff     Unified diff view (2 backends only)
-  --no-cache             Skip cache, force fresh calls
-  --copy                 Copy result to clipboard
-  -t, --timeout INT      Per-backend timeout seconds (default: 180)
-  -v, --verbose          Print subprocess command lines
-  --help                 Show this message
+Round 1 (INITIAL):  All models answer independently
+Round 2 (CRITIQUE):  Each model critiques others' answers
+Round 3 (REVISE):    Models revise based on feedback
+       ↓
+    SYNTHESIS:       Judge generates consensus report:
+                     ✅ Consensus points
+                     🔀 Divergences
+                     💡 Unique insights
 ```
 
-Environment variables: `CONCLAVE_BACKENDS`, `CONCLAVE_FORMAT`, `CONCLAVE_DIFF`, `CONCLAVE_TIMEOUT`.
+## Provider System
 
-## Features
+conclave v3 supports any backend through a provider plugin system:
 
-- ⚡ **Parallel execution** — all backends run simultaneously
-- 📊 **Live progress** — see results as they arrive
-- 🔍 **Diff view** — unified-diff between two model outputs
-- 💾 **Smart cache** — same prompt within 5 minutes doesn't re-call models
-- 📋 **One-copy** — `--copy` puts output on your clipboard
-- 🛡️ **Safe subprocess** — no `shell=True`, no command injection
-- 🎨 **Rich terminal UI** — color-coded status
-- 🐧 **macOS + Linux** — v0.1 (Windows in v0.2)
+```yaml
+# ~/.conclave/config.yaml
+providers:
+  claude:
+    provider_type: cli
+    model: claude-sonnet-4
+    executable: claude
+  openai:
+    provider_type: openai
+    model: gpt-5.6-sol
+    api_key: ${OPENAI_API_KEY}
+```
 
-## Exit Codes
+## Architecture
 
-| Code | Meaning |
-|------|---------|
-| 0 | All backends succeeded |
-| 2 | Partial success (some failed) |
-| 1 | All backends failed |
+```
+Layer 4: CLI (click + rich)
+Layer 3: Protocol Engine (DeliberationEngine)
+Layer 2: Scheduler (parallel ThreadPoolExecutor)
+Layer 1: Providers (CLI / OpenAI / Anthropic / DeepSeek)
+Layer 0: Config + Cache + Formatters
+```
 
 ## Development
 
@@ -122,9 +95,10 @@ Environment variables: `CONCLAVE_BACKENDS`, `CONCLAVE_FORMAT`, `CONCLAVE_DIFF`, 
 git clone https://github.com/doctorzero666/conclave
 cd conclave
 pip install -e ".[dev]"
-pytest
+pytest       # 22 tests
+ruff check   # lint
 ```
 
 ## License
 
-MIT
+MIT — Zhichao Jiang

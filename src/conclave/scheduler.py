@@ -1,174 +1,315 @@
-"""并行调度器：ThreadPoolExecutor + rich.Live 实时展示。"""
+"""并行调度器 V3 — ThreadPoolExecutor + BaseProvider 接口
 
-import signal
+设计要点：
+- 纯同步，concurrent.futures.ThreadPoolExecutor
+- 每个 provider 在独立线程中调用 invoke()
+- 收集 ProviderResponse → 组装 DeliberationRound
+- 支持 per-provider timeout
+- 支持流式并行调用（每轮收集所有 provider 的最新 chunk）
+- terminate_all() 终止 CLI 子进程
+"""
+
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-from typing import Optional
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
+from typing import Callable, Iterator, Optional
 
-from rich.console import Console
-from rich.live import Live
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.table import Table
-
-from .backends.base import AllBackendsFailedError, Backend, Response
+from .providers.base import BaseProvider
+from .protocol import DeliberationRound, ProviderResponse, RoundType, StreamChunk
 
 
 class Scheduler:
-    """并行调用多个 Backend，实时展示进度和结果。
+    """并行调度器 — 并行调用多个 provider，收集响应为 DeliberationRound。"""
 
-    设计要点：
-    - ThreadPoolExecutor 并行执行
-    - 每个 backend 通过 on_chunk 回调把输出片段推入队列
-    - 主线程消费队列，用 rich.Live 实时刷新面板
-    - 先返回的先展示
-    - SIGINT 传播到所有子进程
-    """
+    def __init__(self, max_workers: int = 8, console=None):
+        """
+        Args:
+            max_workers: ThreadPoolExecutor 最大线程数
+            console: rich.Console 实例（用于实时展示，可选）
+        """
+        self.max_workers = max_workers
+        self.console = console
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._terminated = threading.Event()
 
-    MAX_WORKERS = 4
+    # ── 同步并行调用 ──────────────────────────────────────────────
 
-    def __init__(self, console: Optional[Console] = None):
-        self.console = console or Console()
-
-    def run_all(
+    def run_parallel(
         self,
+        providers: list[BaseProvider],
         prompt: str,
-        backends: list[Backend],
-        timeout: float = 180,
-    ) -> list[Response]:
-        """并行运行所有 backend，返回成功的响应列表。
+        system_prompt: Optional[str] = None,
+        timeout: int = 180,
+        round_num: int = 1,
+        round_type: RoundType = RoundType.INITIAL,
+        stream_callback: Optional[Callable] = None,
+    ) -> DeliberationRound:
+        """并行调用所有 provider，收集响应为 DeliberationRound。
 
         Args:
+            providers: BaseProvider 实例列表
             prompt: 用户 prompt
-            backends: backend 实例列表
-            timeout: 每个 backend 的独立超时
+            system_prompt: 可选的 system prompt
+            timeout: 每个 provider 的超时时间（秒）
+            round_num: 轮次编号
+            round_type: 轮次类型
+            stream_callback: 流式回调，签名为 callback(provider_name, chunk_text)
 
         Returns:
-            成功的 Response 列表
-
-        Raises:
-            AllBackendsFailedError: 所有 backend 全部失败
+            DeliberationRound 包含所有 provider 的响应
         """
-        n = len(backends)
+        n = len(providers)
         if n == 0:
-            raise AllBackendsFailedError({})
+            return DeliberationRound(
+                round_num=round_num,
+                round_type=round_type,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
 
-        results: dict[str, Response] = {}    # backend_name → Response
-        errors: dict[str, str] = {}          # backend_name → error message
-        outputs: dict[str, list[str]] = {}   # backend_name → 实时输出行
-        output_lock = threading.Lock()
-        result_queue: Queue = Queue()
+        started_at = datetime.now(timezone.utc).isoformat()
+        responses: list[Optional[ProviderResponse]] = [None] * n  # 保持顺序
+        errors: dict[int, str] = {}
+        lock = threading.Lock()
+        self._terminated.clear()
 
-        # 注册 SIGINT handler —— 注意：Python 信号处理只在主线程执行，
-        # 我们在这里设一个标志位，子线程负责 terminate
-        interrupted = threading.Event()
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, n)) as executor:
+            futures: dict[Future, int] = {}
+            for i, provider in enumerate(providers):
+                fut = executor.submit(
+                    self._invoke_one,
+                    provider, prompt, system_prompt, timeout,
+                    round_num, round_type, stream_callback,
+                )
+                futures[fut] = i
 
-        def _sigint_handler(sig, frame):
-            interrupted.set()
-
-        old_handler = signal.signal(signal.SIGINT, _sigint_handler)
-
-        try:
-            # 构建 Live 渲染函数
-            def _render_live() -> Table:
-                table = Table.grid(padding=(0, 1))
-                table.add_column(style="bold")
-                for backend in backends:
-                    name = backend.name
-                    with output_lock:
-                        lines = outputs.get(name, [])
-                    if name in results:
-                        resp = results[name]
-                        if resp.error:
-                            status = f"[red]✗ ERROR ({resp.elapsed_ms:.0f}ms)[/red]"
-                        else:
-                            status = f"[green]✓ DONE ({resp.elapsed_ms:.0f}ms)[/green]"
-                    elif name in errors:
-                        status = f"[red]✗ FAILED[/red]"
-                    else:
-                        status = "[yellow]⏳ running...[/yellow]"
-                    table.add_row(f"[bold]{name}[/bold] {status}")
-                    # 显示最新 3 行输出
-                    if lines:
-                        preview = "".join(lines[-3:]).strip()[:120]
-                        if preview:
-                            table.add_row(f"  [dim]{preview}[/dim]")
-                return table
-
-            with Live(_render_live(), console=self.console, refresh_per_second=4,
-                      transient=False) as live:
-                with ThreadPoolExecutor(
-                    max_workers=min(self.MAX_WORKERS, n)
-                ) as executor:
-                    futures = {}
-                    for backend in backends:
-                        fut = executor.submit(
-                            self._invoke_one,
-                            backend,
-                            prompt,
-                            timeout,
-                            results,
-                            errors,
-                            outputs,
-                            output_lock,
-                            result_queue,
-                            interrupted,
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    resp = future.result(timeout=timeout + 10)
+                    with lock:
+                        responses[idx] = resp
+                except FutureTimeoutError:
+                    with lock:
+                        responses[idx] = ProviderResponse(
+                            provider_name=providers[idx].name,
+                            model=providers[idx].model,
+                            text="",
+                            error=f"超时（{timeout}s）",
+                            round_num=round_num,
+                            round_type=round_type,
                         )
-                        futures[fut] = backend.name
+                except Exception as e:
+                    with lock:
+                        responses[idx] = ProviderResponse(
+                            provider_name=providers[idx].name,
+                            model=providers[idx].model,
+                            text="",
+                            error=str(e),
+                            round_num=round_num,
+                            round_type=round_type,
+                        )
 
-                    # 消费结果队列 + 定期刷新
-                    for future in as_completed(futures):
-                        backend_name = futures[future]
-                        try:
-                            future.result()
-                        except Exception:
-                            pass
-
-                        live.update(_render_live())
-
-            # 收集成功的响应
-            successful = [r for r in results.values() if r.error is None]
-            # 也收集有 error 但至少拿到了 text 的（部分成功）
-            partial = [r for r in results.values() if r.error is not None and r.text]
-
-            all_ok = successful + partial
-
-            if not all_ok:
-                raise AllBackendsFailedError(errors)
-
-            return all_ok
-
-        finally:
-            signal.signal(signal.SIGINT, old_handler)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        # 过滤掉 None（理论上不会发生），并转为非 Optional 列表
+        final_responses: list[ProviderResponse] = [r for r in responses if r is not None]
+        return DeliberationRound(
+            round_num=round_num,
+            round_type=round_type,
+            responses=final_responses,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
 
     def _invoke_one(
         self,
-        backend: Backend,
+        provider: BaseProvider,
         prompt: str,
-        timeout: float,
-        results: dict,
-        errors: dict,
-        outputs: dict,
-        lock: threading.Lock,
-        queue: Queue,
-        interrupted: threading.Event,
-    ) -> None:
-        """在独立线程中调用一个 backend。"""
-        def _on_chunk(line: str):
-            if interrupted.is_set():
-                return
-            queue.put((backend.name, line))
-            with lock:
-                outputs.setdefault(backend.name, []).append(line)
+        system_prompt: Optional[str],
+        timeout: int,
+        round_num: int,
+        round_type: RoundType,
+        stream_callback: Optional[Callable],
+    ) -> ProviderResponse:
+        """在独立线程中调用单个 provider。
 
+        如果支持流式且有 stream_callback，走 stream 路径；
+        否则直接 invoke。
+        """
+        if self._terminated.is_set():
+            return ProviderResponse(
+                provider_name=provider.name,
+                model=provider.model,
+                text="",
+                error="已终止",
+                round_num=round_num,
+                round_type=round_type,
+            )
+
+        t0 = time.monotonic()
+
+        # 如果 provider 支持流式且传入了 stream_callback，走流式
+        caps = provider.capabilities()
+        if caps.supports_streaming and stream_callback is not None:
+            try:
+                full_text = ""
+                finish_reason = "stop"
+                for chunk in provider.stream(prompt, system_prompt, timeout):
+                    if self._terminated.is_set():
+                        break
+                    if chunk.error:
+                        raise RuntimeError(chunk.error)
+                    if chunk.delta:
+                        full_text += chunk.delta
+                        try:
+                            stream_callback(provider.name, chunk.delta)
+                        except Exception:
+                            pass
+                    if chunk.is_done:
+                        finish_reason = chunk.finish_reason or "stop"
+                        break
+                elapsed = int((time.monotonic() - t0) * 1000)
+                return ProviderResponse(
+                    provider_name=provider.name,
+                    model=provider.model,
+                    text=full_text,
+                    finish_reason=finish_reason,
+                    elapsed_ms=elapsed,
+                    round_num=round_num,
+                    round_type=round_type,
+                )
+            except Exception as e:
+                elapsed = int((time.monotonic() - t0) * 1000)
+                return ProviderResponse(
+                    provider_name=provider.name,
+                    model=provider.model,
+                    text="",
+                    error=str(e),
+                    elapsed_ms=elapsed,
+                    round_num=round_num,
+                    round_type=round_type,
+                )
+
+        # 否则直接 invoke
         try:
-            if interrupted.is_set():
-                errors[backend.name] = "Interrupted"
-                return
-            resp = backend.invoke(prompt, timeout=timeout, on_chunk=_on_chunk)
-            results[backend.name] = resp
-            if resp.error:
-                errors[backend.name] = resp.error
+            resp = provider.invoke(prompt, system_prompt, timeout)
+            resp.round_num = round_num
+            resp.round_type = round_type
+            if stream_callback and resp.ok:
+                try:
+                    stream_callback(provider.name, resp.text)
+                except Exception:
+                    pass
+            return resp
         except Exception as e:
-            errors[backend.name] = str(e)
+            elapsed = int((time.monotonic() - t0) * 1000)
+            return ProviderResponse(
+                provider_name=provider.name,
+                model=provider.model,
+                text="",
+                error=str(e),
+                elapsed_ms=elapsed,
+                round_num=round_num,
+                round_type=round_type,
+            )
+
+    # ── 流式并行调用 ──────────────────────────────────────────────
+
+    def run_parallel_streaming(
+        self,
+        providers: list[BaseProvider],
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        timeout: int = 180,
+        round_num: int = 1,
+        round_type: RoundType = RoundType.INITIAL,
+    ) -> Iterator[list[Optional[StreamChunk]]]:
+        """并行流式调用，每次 yield 所有 provider 的最新 chunks。
+
+        每个 provider 在独立线程中 stream()，chunks 通过队列收集。
+        主线程每次从队列取出所有可用的 chunk，按 provider 分组后 yield。
+
+        Args:
+            providers: BaseProvider 实例列表
+            prompt: 用户 prompt
+            system_prompt: 可选的 system prompt
+            timeout: 每个 provider 的超时
+            round_num: 轮次编号
+            round_type: 轮次类型
+
+        Yields:
+            list[StreamChunk]: 每个 provider 的最新 chunk（未完成的 provider 可能为空）
+        """
+        n = len(providers)
+        if n == 0:
+            return
+
+        from queue import Queue
+
+        chunk_queue: Queue = Queue()
+        done_count = [0]  # 用 list 做可变计数器
+        lock = threading.Lock()
+        self._terminated.clear()
+
+        def _stream_one(provider: BaseProvider, idx: int):
+            try:
+                for chunk in provider.stream(prompt, system_prompt, timeout):
+                    if self._terminated.is_set():
+                        break
+                    chunk_queue.put((idx, chunk))
+            except Exception as e:
+                chunk_queue.put((idx, StreamChunk(
+                    provider_name=provider.name,
+                    delta="",
+                    is_done=True,
+                    error=str(e),
+                )))
+            finally:
+                with lock:
+                    done_count[0] += 1
+
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, n)) as executor:
+            for i, provider in enumerate(providers):
+                executor.submit(_stream_one, provider, i)
+
+            # 持续从队列取 chunk，直到所有 provider 完成
+            while done_count[0] < n:
+                batch: list[Optional[StreamChunk]] = [None] * n
+                has_any = False
+
+                # 非阻塞地取出当前队列中所有 chunk
+                while True:
+                    try:
+                        idx, chunk = chunk_queue.get(timeout=0.05)
+                        batch[idx] = chunk
+                        has_any = True
+                    except Exception:
+                        break
+
+                if has_any:
+                    yield batch
+
+        # 最后再 drain 一次队列
+        final_batch: list[Optional[StreamChunk]] = [None] * n
+        while not chunk_queue.empty():
+            try:
+                idx, chunk = chunk_queue.get_nowait()
+                final_batch[idx] = chunk
+            except Exception:
+                break
+        yield final_batch
+
+    # ── 终止 ──────────────────────────────────────────────────────
+
+    def terminate_all(self):
+        """终止所有正在运行的子进程（CLI provider 用）。
+
+        设置终止标志，子线程检测到后停止处理。
+        注意：这不会强制 kill 子进程，子进程在自己的 invoke/stream 实现中应检查此标志。
+        """
+        self._terminated.set()
+
+    def is_terminated(self) -> bool:
+        """检查是否已设置终止标志。"""
+        return self._terminated.is_set()
