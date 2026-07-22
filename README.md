@@ -47,7 +47,48 @@ conclave "Review this architecture" --providers claude,deepseek
 
 # JSON output
 conclave "Compare Kubernetes vs Nomad" --format json --rounds 2
+
+# Prompt from a file (long / multiline specs — no shell pipes needed)
+conclave run --prompt-file ./spec.md --providers claude,codex --rounds 1
+
+# Persist result to disk (JSON is un-truncated; markdown is ANSI-free)
+conclave run --prompt-file ./spec.md \
+    --providers claude,codex \
+    --format json --output ./deliberation.json
 ```
+
+### `--prompt-file` and `--output`
+
+- `--prompt-file PATH` reads the prompt from a UTF-8 file. Mutually exclusive
+  with the positional `PROMPT`. Empty/missing/non-UTF-8/directory inputs raise
+  a clear error.
+- `--output PATH` writes the full result to disk.
+  - `--format json` writes the complete `DeliberationResult` as JSON (response
+    text is **not** truncated, unlike the terminal preview).
+  - `--format markdown` writes plain, ANSI-free markdown.
+  - If writing fails (permissions, missing parent dir, …) conclave prints a
+    warning but keeps the deliberation exit code.
+- Passing the same path to `--prompt-file` and `--output` is rejected so the
+  input can never be clobbered.
+
+### Migrating from `hermes_fusion.py`
+
+The old fusion runner used `echo "$SPEC" | python3 hermes_fusion.py …`, which
+Hermes Tirith blocks as `pipe_to_interpreter`. Replace it with a `--prompt-file`
+call — no stdin pipe, no interactive TUI:
+
+```bash
+# ❌ blocked by Hermes and hangs on multiline prompts
+echo "$SPEC" | python3 ~/.hermes/scripts/hermes_fusion.py --providers claude,codex
+
+# ✅ conclave equivalent
+conclave run --prompt-file ./spec.md \
+    --providers claude,codex --rounds 1 \
+    --format json --output ./out.json
+```
+
+The default Claude preset now runs `claude -p "{prompt}"`, so long or multiline
+prompts no longer drop into the interactive TUI and hang.
 
 ## Deliberation Protocol
 
