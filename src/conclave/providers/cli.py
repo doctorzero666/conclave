@@ -14,7 +14,8 @@ MAX_STDOUT_BYTES = 10 * 1024 * 1024
 
 # 支持的 CLI 可执行文件及其默认参数模板
 CLI_PRESETS = {
-    "claude": ["{prompt}"],
+    # -p 走非交互 print 模式；否则 `claude "..."` 会启动交互式 TUI 挂住。
+    "claude": ["-p", "{prompt}"],
     "codex": ["exec", "{prompt}", "--skip-git-repo-check"],
 }
 
