@@ -66,8 +66,8 @@ def _default_providers() -> dict[str, ProviderConfig]:
     """内置默认 provider 配置"""
     providers = {}
     providers["claude"] = ProviderConfig(
-        name="claude", provider_type="cli", model="claude-sonnet-4",
-        executable="claude", args_template=["-p", "{prompt}"],
+        name="claude", provider_type="cli", model="claude-fable-5",
+        executable="claude", args_template=["-p", "{prompt}", "--model", "{model}"],
     )
     providers["codex"] = ProviderConfig(
         name="codex", provider_type="cli", model="gpt-5.6-sol",
@@ -115,16 +115,17 @@ def load_config() -> Config:
     if "providers" in raw:
         for name, pdata in raw["providers"].items():
             pc = ProviderConfig(name=name, **pdata)
-            # 迁移：老 claude args_template=["{prompt}"] 会进交互 TUI 挂住。
-            # 只迁移真正的 legacy 默认配置 (name=claude & executable=claude &
-            # args_template=["{prompt}"])。自定义 executable (wrapper) 或
-            # 自定义 args_template 都必须原样保留 — wrapper 可能不支持 -p。
+            # 迁移：老 claude args_template 不带 --model，配置的 model 仅是
+            # metadata，实际 CLI 走的是默认模型。只迁移真正的 legacy 默认配置
+            # (name=claude & executable=claude & args_template ∈ 已知旧默认)。
+            # 自定义 executable (wrapper) 或自定义 args_template（尤其已含
+            # --model 或其它 flag）都必须原样保留。
             if (
                 pc.name == "claude"
                 and pc.executable == "claude"
-                and pc.args_template == ["{prompt}"]
+                and pc.args_template in (["{prompt}"], ["-p", "{prompt}"])
             ):
-                pc.args_template = ["-p", "{prompt}"]
+                pc.args_template = ["-p", "{prompt}", "--model", "{model}"]
             config.providers[name] = pc
 
     return config

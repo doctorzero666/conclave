@@ -15,7 +15,8 @@ MAX_STDOUT_BYTES = 10 * 1024 * 1024
 # 支持的 CLI 可执行文件及其默认参数模板
 CLI_PRESETS = {
     # -p 走非交互 print 模式；否则 `claude "..."` 会启动交互式 TUI 挂住。
-    "claude": ["-p", "{prompt}"],
+    # --model 把配置的 model 传给 Claude CLI，避免仅改 metadata 却仍走 CLI 默认。
+    "claude": ["-p", "{prompt}", "--model", "{model}"],
     "codex": ["exec", "{prompt}", "--skip-git-repo-check"],
 }
 
@@ -44,7 +45,7 @@ class CLIProvider(BaseProvider):
 
         Args:
             name: provider 名称，如 "claude"
-            model: 模型标识，如 "claude-sonnet-4"
+            model: 模型标识，如 "claude-fable-5"
             executable: 可执行文件名，如 "claude" 或 "codex"
             args_template: 参数模板列表，"{prompt}" 会被替换。None 则使用预设。
             timeout: 默认超时秒数
@@ -97,8 +98,15 @@ class CLIProvider(BaseProvider):
         """
         start = time.time()
 
-        # 1. 构造参数列表（替换 {prompt} 占位符）
-        args = [arg.format(prompt=prompt) for arg in self.args_template]
+        # 1. 构造参数列表（替换 {prompt} / {model} 占位符）
+        # model 归一：None / "" 都当作空串，避免 format 出字面量 `--model None`。
+        model = self.model or ""
+        # str.format 允许多余 kwargs，自定义 template 不含 {model} 也不会报错。
+        args = [arg.format(prompt=prompt, model=model) for arg in self.args_template]
+
+        # model 为空时不能传 `--model ""`（CLI 会拒绝），去掉该 flag 走 CLI 默认模型。
+        if not model:
+            args = self._strip_empty_model_flag(args)
 
         # 2. 启动子进程（安全：list args + 禁用 shell=True）
         try:
@@ -220,6 +228,23 @@ class CLIProvider(BaseProvider):
         )
 
     # ── 工具方法 ───────────────────────────────────────────────
+
+    @staticmethod
+    def _strip_empty_model_flag(args: list[str]) -> list[str]:
+        """丢弃 `--model ""` 与 `--model=`，保留其余参数。"""
+        cleaned: list[str] = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--model" and i + 1 < len(args) and args[i + 1] == "":
+                i += 2
+                continue
+            if arg == "--model=":
+                i += 1
+                continue
+            cleaned.append(arg)
+            i += 1
+        return cleaned
 
     @staticmethod
     def detect(executable_name: str) -> bool:

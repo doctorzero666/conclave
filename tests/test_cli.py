@@ -704,11 +704,177 @@ def test_claude_preset_includes_dash_p():
     assert "{prompt}" in CLI_PRESETS["claude"]
 
 
+def test_claude_preset_passes_model_flag():
+    from conclave.providers.cli import CLI_PRESETS
+    assert CLI_PRESETS["claude"] == ["-p", "{prompt}", "--model", "{model}"]
+
+
 def test_default_claude_config_uses_dash_p():
     from conclave.config import _default_providers
     providers = _default_providers()
     assert "claude" in providers
-    assert providers["claude"].args_template == ["-p", "{prompt}"]
+    assert providers["claude"].args_template == [
+        "-p", "{prompt}", "--model", "{model}"
+    ]
+
+
+def test_cli_provider_substitutes_model_placeholder(monkeypatch):
+    """CLIProvider.invoke 必须把 self.model 替换进 {model} 占位符。"""
+    from conclave.providers import cli as cli_module
+
+    captured = {}
+
+    class FakeProc:
+        stdin = None
+        stdout = iter([])
+        stderr = None
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # Emulate iterable stdout of a real Popen text=True stream.
+        proc = FakeProc()
+        proc.stdout = iter(["ok\n"])
+        return proc
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli_module.subprocess, "Popen", fake_popen)
+
+    provider = cli_module.CLIProvider(
+        name="claude", model="claude-fable-5", executable="claude",
+    )
+    resp = provider.invoke("hello world")
+
+    assert resp.text == "ok"
+    assert captured["cmd"] == [
+        "/usr/bin/claude", "-p", "hello world", "--model", "claude-fable-5",
+    ]
+
+
+def test_cli_provider_drops_empty_model_flag(monkeypatch):
+    """model 为空时不能生成 `--model ""`，应整体丢弃该 flag。"""
+    from conclave.providers import cli as cli_module
+
+    captured = {}
+
+    class FakeProc:
+        stdin = None
+        stdout = iter([])
+        stderr = None
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        proc = FakeProc()
+        proc.stdout = iter(["ok\n"])
+        return proc
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli_module.subprocess, "Popen", fake_popen)
+
+    provider = cli_module.CLIProvider(name="claude", model="", executable="claude")
+    resp = provider.invoke("hello world")
+
+    assert resp.ok
+    assert resp.text == "ok"
+    assert "--model" not in captured["cmd"]
+    assert captured["cmd"] == ["/usr/bin/claude", "-p", "hello world"]
+
+
+def test_cli_provider_drops_none_model_flag(monkeypatch):
+    """YAML 显式 `model: null` 时不能生成 `--model None`，应整体丢弃该 flag。"""
+    from conclave.providers import cli as cli_module
+
+    captured = {}
+
+    class FakeProc:
+        stdin = None
+        stdout = iter([])
+        stderr = None
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        proc = FakeProc()
+        proc.stdout = iter(["ok\n"])
+        return proc
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli_module.subprocess, "Popen", fake_popen)
+
+    provider = cli_module.CLIProvider(name="claude", model=None, executable="claude")
+    resp = provider.invoke("hello world")
+
+    assert resp.ok
+    assert resp.text == "ok"
+    assert "--model" not in captured["cmd"]
+    assert "None" not in captured["cmd"]
+    assert captured["cmd"] == ["/usr/bin/claude", "-p", "hello world"]
+
+
+def test_cli_provider_custom_template_without_model_placeholder(monkeypatch):
+    """自定义 args_template 不含 {model} 也不应报错。"""
+    from conclave.providers import cli as cli_module
+
+    captured = {}
+
+    class FakeProc:
+        stdin = None
+        stdout = iter(["out\n"])
+        stderr = None
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli_module.subprocess, "Popen", fake_popen)
+
+    provider = cli_module.CLIProvider(
+        name="custom", model="ignored-model", executable="echo",
+        args_template=["{prompt}"],
+    )
+    resp = provider.invoke("hi")
+
+    assert resp.ok
+    assert captured["cmd"] == ["/usr/bin/echo", "hi"]
 
 
 # ─── Config migration ─────────────────────────────────────────────
@@ -737,7 +903,30 @@ def test_load_config_migrates_old_claude_args_template(monkeypatch, tmp_path):
     monkeypatch.setattr(config_module, "CONFIG_PATH", cfg_path)
 
     cfg = config_module.load_config()
-    assert cfg.providers["claude"].args_template == ["-p", "{prompt}"]
+    assert cfg.providers["claude"].args_template == [
+        "-p", "{prompt}", "--model", "{model}"
+    ]
+
+
+def test_load_config_migrates_dash_p_only_claude_args_template(monkeypatch, tmp_path):
+    """老默认 ["-p", "{prompt}"] 也需要迁移，加上 --model {model}。"""
+    from conclave import config as config_module
+
+    cfg_path = tmp_path / "config.yaml"
+    _write_config_yaml(cfg_path, {
+        "claude": {
+            "provider_type": "cli",
+            "model": "claude-fable-5",
+            "executable": "claude",
+            "args_template": ["-p", "{prompt}"],
+        }
+    })
+    monkeypatch.setattr(config_module, "CONFIG_PATH", cfg_path)
+
+    cfg = config_module.load_config()
+    assert cfg.providers["claude"].args_template == [
+        "-p", "{prompt}", "--model", "{model}"
+    ]
 
 
 def test_load_config_preserves_custom_claude_args_template(monkeypatch, tmp_path):

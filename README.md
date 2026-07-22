@@ -87,8 +87,10 @@ conclave run --prompt-file ./spec.md \
     --format json --output ./out.json
 ```
 
-The default Claude preset now runs `claude -p "{prompt}"`, so long or multiline
-prompts no longer drop into the interactive TUI and hang.
+The default Claude preset now runs `claude -p "{prompt}" --model {model}`, so
+long or multiline prompts no longer drop into the interactive TUI and hang, and
+the `model:` you set in `~/.conclave/config.yaml` is passed through to the
+Claude CLI via `--model` instead of being a metadata-only label.
 
 ## Deliberation Protocol
 
@@ -112,13 +114,15 @@ conclave v3 supports any backend through a provider plugin system:
 providers:
   claude:
     provider_type: cli
-    model: claude-sonnet-4
+    model: claude-fable-5
     executable: claude
   openai:
     provider_type: openai
     model: gpt-5.6-sol
     api_key: ${OPENAI_API_KEY}
 ```
+
+Fable 5 必须写全名 `claude-fable-5`；别名 `fable` 可能不可用。
 
 ## Architecture
 
