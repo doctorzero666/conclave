@@ -47,7 +47,50 @@ conclave "Review this architecture" --providers claude,deepseek
 
 # JSON output
 conclave "Compare Kubernetes vs Nomad" --format json --rounds 2
+
+# Prompt from a file (long / multiline specs — no shell pipes needed)
+conclave run --prompt-file ./spec.md --providers claude,codex --rounds 1
+
+# Persist result to disk (JSON is un-truncated; markdown is ANSI-free)
+conclave run --prompt-file ./spec.md \
+    --providers claude,codex \
+    --format json --output ./deliberation.json
 ```
+
+### `--prompt-file` and `--output`
+
+- `--prompt-file PATH` reads the prompt from a UTF-8 file. Mutually exclusive
+  with the positional `PROMPT`. Empty/missing/non-UTF-8/directory inputs raise
+  a clear error.
+- `--output PATH` writes the full result to disk.
+  - `--format json` writes the complete `DeliberationResult` as JSON (response
+    text is **not** truncated, unlike the terminal preview).
+  - `--format markdown` writes plain, ANSI-free markdown.
+  - If writing fails (permissions, missing parent dir, …) conclave prints a
+    warning but keeps the deliberation exit code.
+- Passing the same path to `--prompt-file` and `--output` is rejected so the
+  input can never be clobbered.
+
+### Migrating from `hermes_fusion.py`
+
+The old fusion runner used `echo "$SPEC" | python3 hermes_fusion.py …`, which
+Hermes Tirith blocks as `pipe_to_interpreter`. Replace it with a `--prompt-file`
+call — no stdin pipe, no interactive TUI:
+
+```bash
+# ❌ blocked by Hermes and hangs on multiline prompts
+echo "$SPEC" | python3 ~/.hermes/scripts/hermes_fusion.py --providers claude,codex
+
+# ✅ conclave equivalent
+conclave run --prompt-file ./spec.md \
+    --providers claude,codex --rounds 1 \
+    --format json --output ./out.json
+```
+
+The default Claude preset now runs `claude -p "{prompt}" --model {model}`, so
+long or multiline prompts no longer drop into the interactive TUI and hang, and
+the `model:` you set in `~/.conclave/config.yaml` is passed through to the
+Claude CLI via `--model` instead of being a metadata-only label.
 
 ## Deliberation Protocol
 
@@ -71,13 +114,15 @@ conclave v3 supports any backend through a provider plugin system:
 providers:
   claude:
     provider_type: cli
-    model: claude-sonnet-4
+    model: claude-fable-5
     executable: claude
   openai:
     provider_type: openai
     model: gpt-5.6-sol
     api_key: ${OPENAI_API_KEY}
 ```
+
+Fable 5 必须写全名 `claude-fable-5`；别名 `fable` 可能不可用。
 
 ## Architecture
 
