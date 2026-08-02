@@ -3,6 +3,7 @@ name = "conclave-llm"
 version = "3.0.0"
 description = "Multi-LLM deliberation protocol engine — like a conclave of AI cardinals"
 license = {text = "MIT"}
+readme = "README.md"
 authors = [{name = "Zhichao Jiang", email = "jzc2802148631@163.com"}]
 requires-python = ">=3.10"
 classifiers = [
@@ -41,6 +42,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["conclave", "conclave.*"]
 
 [tool.ruff]
